@@ -1,0 +1,101 @@
+trigger:  none
+
+resources:
+- repo: self
+
+# global variables
+variables:
+  vmImageName: 'ubuntu-latest'
+  azureSubscription: 'azure-conn'
+  aksAzureResourceGroup: '_rg-aks-p-we-001'
+  aksKubernetesClusterName: 'aks-p-we-001'
+  kubernetesServiceEndpoint: 'cluster-conn'
+
+stages:
+- stage: Release
+  jobs:
+    - deployment: DeployToAKS
+      pool:
+        vmImage: $(vmImageName)
+      environment: prod
+      strategy:
+       runOnce:
+         deploy:
+           steps:
+              - checkout: self
+              - task: Kubernetes@1
+                displayName: 'Install AAD Pod Identity'
+                inputs:
+                  connectionType: 'Kubernetes Service Connection'
+                  kubernetesServiceEndpoint: $(kubernetesServiceEndpoint)
+                  command: 'apply'
+                  arguments: '-f manifests/deployment-rbac.yaml'
+                  useClusterAdmin: true
+              - task: AzureCLI@2
+                displayName: 'Find/Replace pod identity and binding values'
+                inputs:
+                  azureSubscription: 'azure-conn'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    NODERESOURCEGROUP=$(az aks list --resource-group _rg-aks-p-we-001  --query [].nodeResourceGroup -o tsv)
+                    CLIENTID=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query identityProfile.kubeletidentity.clientId -o tsv)
+                    NAME=$(az identity list --resource-group ${NODERESOURCEGROUP} --query [].name -o tsv)
+                    RESOURCEID=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query identityProfile.kubeletidentity.resourceId -o tsv)
+                    echo "CLIENTID: ${CLIENTID}"
+                    echo "NAME: ${NAME}"
+                    echo "RESOURCEID: ${RESOURCEID}"
+                    sed -i "s/:CLIENTID:/$CLIENTID/g" manifests/podIdentityAndBinding.yaml
+                    sed -i "s/:NAME:/$NAME/g" manifests/podIdentityAndBinding.yaml
+                    sed -i "s|:RESOURCEID:|$RESOURCEID|g" manifests/podIdentityAndBinding.yaml
+              - task: Kubernetes@1
+                displayName: 'Deploy podIdentityAndBinding'
+                inputs:
+                  connectionType: 'Kubernetes Service Connection'
+                  kubernetesServiceEndpoint: $(kubernetesServiceEndpoint)
+                  command: 'apply'
+                  arguments: '-f manifests/podIdentityAndBinding.yaml'
+                  useClusterAdmin: true
+              - task: AzureCLI@2
+                displayName: 'Assign RBAC to identity'
+                inputs:
+                  azureSubscription: 'azure-conn'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    SUBID=$(az account show --query id -o tsv)
+                    CLIENTID=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query identityProfile.kubeletidentity.clientId -o tsv)
+                    NODE_RESOURCE_GROUP=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query nodeResourceGroup -o tsv)
+                    MANAGED_IDENTITY=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query identityProfile.kubeletidentity.resourceId -o tsv)
+                    az role assignment create --role "Virtual Machine Contributor" --assignee $CLIENTID --scope /subscriptions/$SUBID/resourcegroups/$NODE_RESOURCE_GROUP
+                    az role assignment create --role "Managed Identity Operator" --assignee $CLIENTID --scope /subscriptions/$SUBID/resourcegroups/$NODE_RESOURCE_GROUP
+                    az role assignment create --role "Managed Identity Operator" --assignee $CLIENTID --scope $MANAGED_IDENTITY
+                    AKS_RESOURCE_GROUP=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query resourceGroup -o tsv)
+                    az role assignment create --role "Virtual Machine Contributor" --assignee $CLIENTID --scope /subscriptions/$SUBID/resourcegroups/$AKS_RESOURCE_GROUP
+                    az role assignment create --role "Managed Identity Operator" --assignee $CLIENTID --scope /subscriptions/$SUBID/resourcegroups/$AKS_RESOURCE_GROUP
+              - task: AzureCLI@2
+                displayName: 'Assign managed identity access policy to Key Vault'
+                inputs:
+                  azureSubscription: 'azure-conn'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    KEYVAULT=$(az keyvault list --resource-group _rg-infra-p-we-001 --query [].name -o tsv)
+                    CLIENTID=$(az aks show --resource-group _rg-aks-p-we-001 --name aks-p-we-001 --query identityProfile.kubeletidentity.clientId -o tsv)
+                    az keyvault set-policy --name $KEYVAULT --spn $CLIENTID --secret-permissions get
+              - script: |
+                  helm repo add azure-samples https://azure-samples.github.io/helm-charts/
+                  helm repo update
+                displayName: 'Update Helm repo charts'
+              - task: HelmDeploy@0
+                displayName: 'Helm install aks-helloworld'
+                inputs:
+                  connectionType: 'Azure Resource Manager'
+                  azureSubscription: $(azureSubscription)
+                  azureResourceGroup: $(aksAzureResourceGroup)
+                  kubernetesCluster: $(aksKubernetesClusterName)
+                  namespace: 'default'
+                  command: 'upgrade'
+                  chartType: 'Name'
+                  chartName: 'azure-samples/aks-helloworld'
+                  releaseName: 'aks-helloworld'
